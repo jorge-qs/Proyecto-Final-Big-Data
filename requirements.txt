@@ -1,0 +1,23 @@
+# Base
+pydantic>=2.0
+python-dotenv
+
+# Bases de datos
+pymongo>=4.6
+cassandra-driver>=3.29
+neo4j>=5.14
+
+# Airflow (instalar con: pip install apache-airflow)
+# apache-airflow>=2.8
+
+# Procesamiento
+pandas>=2.1
+vaderSentiment
+
+# Dashboard
+streamlit>=1.32
+plotly>=5.19
+pyvis>=0.3
+
+# Tests
+pytest>=8.0
