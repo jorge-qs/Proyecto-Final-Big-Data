@@ -5,8 +5,10 @@ Dueño: Data Engineer (Rol 1).
 from __future__ import annotations
 import json
 import logging
+import time
 from pathlib import Path
 from datetime import datetime
+from typing import Iterator
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from src.common.config import STAGING_PATH
 from src.common.schema import Business, Review, User, Checkin, Tip
@@ -22,30 +24,27 @@ def _sentiment(text: str) -> float:
     return _vader.polarity_scores(text)["compound"]
 
 
-def _write_jsonl(path: Path, records: list[dict]) -> None:
+def _write_jsonl_stream(path: Path, records_iter: Iterator[dict]) -> int:
+    """Escribe un iterador de dicts en JSONL sin cargar todo en RAM. Devuelve el conteo."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    count = 0
     with open(path, "w", encoding="utf-8") as f:
-        for r in records:
+        for r in records_iter:
             f.write(json.dumps(r, default=str) + "\n")
+            count += 1
+    return count
 
 
-def build_staging_for_date(ds: str) -> dict:
-    """
-    Limpia y escribe el slice de reviews/checkins para la fecha ds (YYYY-MM-DD).
-    Idempotente: re-correr sobreescribe el mismo archivo.
-    Devuelve conteos por entidad.
-    """
-    counts = {"businesses": 0, "users": 0, "reviews": 0, "checkins": 0, "tips": 0}
-
-    # --- Businesses (se cargan completos, no por día) ---
-    businesses, seen_biz = [], set()
+def _gen_businesses() -> Iterator[dict]:
+    seen: set[str] = set()
     for raw in read_businesses():
-        if raw.get("business_id") in seen_biz:
+        bid = raw.get("business_id")
+        if not bid or bid in seen:
             continue
         try:
             cats = [c.strip() for c in (raw.get("categories") or "").split(",") if c.strip()]
             obj = Business(
-                business_id=raw["business_id"],
+                business_id=bid,
                 name=raw.get("name", ""),
                 city=raw.get("city", ""),
                 state=raw.get("state", ""),
@@ -58,22 +57,25 @@ def build_staging_for_date(ds: str) -> dict:
                 longitude=raw.get("longitude"),
                 is_open=raw.get("is_open"),
             )
-            businesses.append(obj.model_dump())
-            seen_biz.add(obj.business_id)
+            seen.add(bid)
+            yield obj.model_dump()
         except Exception as e:
-            logger.warning("business descartado: %s", e)
-    _write_jsonl(Path(STAGING_PATH) / "businesses.jsonl", businesses)
-    counts["businesses"] = len(businesses)
+            logger.warning("business descartado %s: %s", bid, e)
 
-    # --- Users ---
-    users, seen_usr = [], set()
+
+def _gen_users() -> Iterator[dict]:
+    seen: set[str] = set()
     for raw in read_users():
-        if raw.get("user_id") in seen_usr:
+        uid = raw.get("user_id")
+        if not uid or uid in seen:
             continue
         try:
-            friends = [f.strip() for f in (raw.get("friends") or "").split(",") if f.strip() and f.strip() != "None"]
+            friends = [
+                f.strip() for f in (raw.get("friends") or "").split(",")
+                if f.strip() and f.strip() != "None"
+            ]
             obj = User(
-                user_id=raw["user_id"],
+                user_id=uid,
                 name=raw.get("name", ""),
                 review_count=int(raw.get("review_count", 0)),
                 yelping_since=raw["yelping_since"][:10],
@@ -81,22 +83,22 @@ def build_staging_for_date(ds: str) -> dict:
                 average_stars=float(raw.get("average_stars", 0)),
                 friends=friends,
             )
-            users.append(obj.model_dump())
-            seen_usr.add(obj.user_id)
+            seen.add(uid)
+            yield obj.model_dump()
         except Exception as e:
-            logger.warning("user descartado: %s", e)
-    _write_jsonl(Path(STAGING_PATH) / "users.jsonl", users)
-    counts["users"] = len(users)
+            logger.warning("user descartado %s: %s", uid, e)
 
-    # --- Reviews del día ds ---
-    reviews, seen_rev = [], set()
+
+def _gen_reviews(ds: str) -> Iterator[dict]:
+    seen: set[str] = set()
     for raw in read_reviews():
         raw_date = (raw.get("date") or "")[:10]
-        if raw_date != ds or raw.get("review_id") in seen_rev:
+        rid = raw.get("review_id")
+        if raw_date != ds or not rid or rid in seen:
             continue
         try:
             obj = Review(
-                review_id=raw["review_id"],
+                review_id=rid,
                 user_id=raw["user_id"],
                 business_id=raw["business_id"],
                 stars=float(raw["stars"]),
@@ -107,15 +109,13 @@ def build_staging_for_date(ds: str) -> dict:
                 date=raw_date,
                 sentiment=_sentiment(raw.get("text", "")),
             )
-            reviews.append(obj.model_dump())
-            seen_rev.add(obj.review_id)
+            seen.add(rid)
+            yield obj.model_dump()
         except Exception as e:
-            logger.warning("review descartada: %s", e)
-    _write_jsonl(Path(STAGING_PATH) / f"reviews/dt={ds}/part.jsonl", reviews)
-    counts["reviews"] = len(reviews)
+            logger.warning("review descartada %s: %s", rid, e)
 
-    # --- Checkins del día ds ---
-    checkins = []
+
+def _gen_checkins(ds: str) -> Iterator[dict]:
     for raw in read_checkins():
         for ts_str in (raw.get("date") or "").split(","):
             ts_str = ts_str.strip()
@@ -126,17 +126,16 @@ def build_staging_for_date(ds: str) -> dict:
                 if ts.strftime("%Y-%m-%d") != ds:
                     continue
                 obj = Checkin(business_id=raw["business_id"], checkin_ts=ts)
-                checkins.append(obj.model_dump())
+                yield obj.model_dump()
             except Exception as e:
                 logger.warning("checkin descartado: %s", e)
-    _write_jsonl(Path(STAGING_PATH) / f"checkins/dt={ds}/part.jsonl", checkins)
-    counts["checkins"] = len(checkins)
 
-    # --- Tips ---
-    tips, seen_tip = [], set()
+
+def _gen_tips() -> Iterator[dict]:
+    seen: set[tuple] = set()
     for raw in read_tips():
         key = (raw.get("user_id"), raw.get("business_id"), (raw.get("date") or "")[:10])
-        if key in seen_tip:
+        if key in seen:
             continue
         try:
             obj = Tip(
@@ -146,12 +145,45 @@ def build_staging_for_date(ds: str) -> dict:
                 business_id=raw["business_id"],
                 user_id=raw["user_id"],
             )
-            tips.append(obj.model_dump())
-            seen_tip.add(key)
+            seen.add(key)
+            yield obj.model_dump()
         except Exception as e:
             logger.warning("tip descartado: %s", e)
-    _write_jsonl(Path(STAGING_PATH) / "tips.jsonl", tips)
-    counts["tips"] = len(tips)
+
+
+def build_staging_for_date(ds: str) -> dict:
+    """
+    Limpia y escribe el slice de reviews/checkins para la fecha ds (YYYY-MM-DD).
+    Idempotente: re-correr sobreescribe los mismos archivos.
+    Usa escritura en streaming para evitar OOM con el dataset completo.
+    Devuelve conteos por entidad.
+    """
+    counts: dict[str, int] = {}
+    staging = Path(STAGING_PATH)
+
+    t0 = time.perf_counter()
+    counts["businesses"] = _write_jsonl_stream(staging / "businesses.jsonl", _gen_businesses())
+    logger.info("businesses: %d en %.1fs", counts["businesses"], time.perf_counter() - t0)
+
+    t0 = time.perf_counter()
+    counts["users"] = _write_jsonl_stream(staging / "users.jsonl", _gen_users())
+    logger.info("users: %d en %.1fs", counts["users"], time.perf_counter() - t0)
+
+    t0 = time.perf_counter()
+    counts["reviews"] = _write_jsonl_stream(
+        staging / f"reviews/dt={ds}/part.jsonl", _gen_reviews(ds)
+    )
+    logger.info("reviews[%s]: %d en %.1fs", ds, counts["reviews"], time.perf_counter() - t0)
+
+    t0 = time.perf_counter()
+    counts["checkins"] = _write_jsonl_stream(
+        staging / f"checkins/dt={ds}/part.jsonl", _gen_checkins(ds)
+    )
+    logger.info("checkins[%s]: %d en %.1fs", ds, counts["checkins"], time.perf_counter() - t0)
+
+    t0 = time.perf_counter()
+    counts["tips"] = _write_jsonl_stream(staging / "tips.jsonl", _gen_tips())
+    logger.info("tips: %d en %.1fs", counts["tips"], time.perf_counter() - t0)
 
     logger.info("Staging para %s completado: %s", ds, counts)
     return counts

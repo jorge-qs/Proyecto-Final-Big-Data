@@ -186,7 +186,59 @@ Detalle completo en `05_airflow_dashboard.md`.
 
 ---
 
-## 9. Entregables (del documento del profe)
+## 9. Modos de datos y carga inicial
+
+### Tres modos de dataset
+
+| Modo | Archivos | Cuándo usarlo |
+|---|---|---|
+| **demo** | `*_demo.json` (500 biz, 5 000 reviews) | Presentación en clase — pipeline completo en < 2 min |
+| **sample** | `*_sample.json` (14 567 biz, 200 000 reviews) | Desarrollo y pruebas en local |
+| **full** | archivos originales sin sufijo | Producción (requiere > 8 GB RAM) |
+
+El `reader.py` detecta automáticamente el modo con prioridad `_demo > _sample > original`. No hay que tocar `config.py`.
+
+### Generar el dataset de demo (para la presentación)
+
+```bash
+# Desde la raíz del proyecto, con el venv activado
+python scripts/sample_raw.py --city Philadelphia --state PA --demo
+```
+
+Esto crea `data/raw/*_demo.json`. A partir de ese momento el pipeline usará esos archivos automáticamente.
+
+### Carga histórica inicial (poblar las bases con todos los datos)
+
+El DAG carga reseñas de forma incremental (un día a la vez). Para tener datos históricos completos en las bases ejecuta **una sola vez**:
+
+```bash
+PYTHONPATH=. python scripts/bulk_ingest.py              # carga todo (200 000 reviews)
+PYTHONPATH=. python scripts/bulk_ingest.py --limit 50000   # carga parcial para prueba
+```
+
+Esto carga reviews a MongoDB, Cassandra (agrupadas por fecha) y Neo4j (aristas REVIEWED).
+
+### Volver al modo sample / full
+
+```bash
+# Borrar los archivos demo para que el reader use los _sample
+rm data/raw/*_demo.json
+
+# Volver a generar el sample si se quiere cambiar de ciudad
+python scripts/sample_raw.py --city "Las Vegas" --state NV
+```
+
+### Levantar el entorno completo
+
+```bash
+./start.sh                 # levanta Docker + Airflow
+# Abrir http://localhost:8080 → activar DAG yelp_pipeline → Trigger DAG
+streamlit run dashboard/app.py  # abrir http://localhost:8501
+```
+
+---
+
+## 10. Entregables (del documento del profe)
 
 - [ ] Informe técnico (PDF) — secciones en `docs/`
 - [ ] Código fuente completo (este repo)
