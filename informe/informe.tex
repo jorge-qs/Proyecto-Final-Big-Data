@@ -886,6 +886,85 @@ que consumen las tres bases de datos directamente.
 \end{figure}
 
 %% ══════════════════════════════════════════════════════════════
+\section{Análisis de Resultados}
+
+Los nueve KPIs calculados sobre las 5,572 fechas históricas (2005--2022) revelan patrones
+concretos sobre la dinámica de reseñas en Philadelphia.
+
+\subsection{Evolución del volumen de reseñas}
+
+El volumen diario de reseñas (\texttt{reviews\_per\_day}) muestra un crecimiento sostenido
+entre 2005 y 2018, con un pico pronunciado en el período 2017--2019 donde días individuales
+superan las 150 reseñas procesadas. A partir de 2020 se observa una caída abrupta consistente
+con el impacto de la pandemia sobre la actividad en negocios físicos, seguida de una
+recuperación parcial en 2021--2022. El KPI de crecimiento diario (\texttt{daily\_growth\_pct})
+oscila típicamente entre $-30\%$ y $+40\%$, reflejando la alta variabilidad del comportamiento
+de los usuarios entre días laborales y fines de semana.
+
+\subsection{Calidad y sentimiento por categoría}
+
+El dashboard revela que las categorías con mayor rating promedio ponderado
+(\texttt{avg\_stars\_of\_day}) se mantienen consistentemente entre 3.8 y 4.2 estrellas a lo
+largo de todo el período, con muy poca dispersión. Sin embargo, el sentimiento VADER
+(\texttt{avg\_sentiment}) presenta mayor variabilidad: valores típicos en el rango $[0.15, 0.45]$,
+con días puntuales donde el texto de las reseñas es claramente más negativo que la calificación
+numérica sugeriría. Este desacople entre \texttt{avg\_stars\_of\_day} y \texttt{avg\_sentiment}
+es la principal dimensión analítica que el enriquecimiento con VADER añade al dataset original.
+
+El KPI de porcentaje de categorías con rating $\geq 4.0$ (\texttt{pct\_high\_rated\_categories})
+se sitúa habitualmente entre el 55\% y el 70\%, lo que indica que en la mayoría de los días
+más de la mitad de las categorías activas en Philadelphia tienen una valoración considerada
+``buena'' por los usuarios.
+
+\subsection{Red social Neo4j}
+
+El grafo social extraído del dataset presenta una distribución de grado altamente asimétrica:
+el usuario más influyente (Michelle) acumula 3,782 conexiones FRIEND, mientras que la mediana
+se sitúa por debajo de 10. Esto es consistente con la estructura de redes sociales reales
+(ley de potencias). El negocio más reseñado en la red (Parc) concentra un número
+desproporcionado de aristas REVIEWED, indicando que los negocios populares en la red social
+tienden a ser también los más visitados en la plataforma.
+
+%% ══════════════════════════════════════════════════════════════
+\section{Retos y Decisiones Técnicas}
+
+\subsection{Partición en Cassandra: \texttt{year\_month} sobre \texttt{date}}
+
+El primer diseño de \texttt{daily\_review\_counts} usaba \texttt{review\_date} como clave de
+partición. Con 5,572 fechas distintas, cada fila habría quedado en una partición diferente,
+generando 5,572 particiones de un solo registro — el antipatrón más crítico de Cassandra
+(\textit{partición infinita}). La solución fue agrupar por \texttt{year\_month} (ej.\
+\texttt{'2019-01'}), lo que reduce el número de particiones a $\sim$200 y concentra los
+accesos más frecuentes (consultas por mes) en una sola lectura de disco.
+
+\subsection{Paralelismo en el DAG: tres loaders independientes}
+
+El diseño inicial del DAG ejecutaba los loaders de forma secuencial:
+\texttt{load\_mongo} $\to$ \texttt{transform\_load\_cassandra} $\to$ \texttt{build\_load\_neo4j}.
+Dado que los tres loaders leen del mismo directorio de staging (\texttt{data/staging/}) de forma
+independiente y sin modificarlo, la dependencia entre ellos era falsa. Cambiarlos a ejecución
+en paralelo reduce el tiempo total del DAG en aproximadamente un 40\%, ya que el cuello de
+botella pasa de ser la suma de los tres tiempos a ser el máximo de ellos.
+
+\subsection{VADER en la etapa de limpieza, no en la de KPIs}
+
+Aplicar el análisis de sentimiento durante \texttt{validate\_clean} (staging) en lugar de en
+\texttt{generate\_kpis} tiene dos ventajas: (1) el campo \texttt{sentiment} queda persistido
+en Cassandra junto con cada reseña, disponible para cualquier consulta futura sin recalcular;
+(2) el costo computacional de VADER (O(n) sobre el texto) se paga una sola vez por reseña,
+no en cada corrida del DAG. La desventaja es que el staging ocupa más espacio en disco, trade-off
+aceptable dado el volumen del dataset.
+
+\subsection{Filtrado de fechas sin reseñas en el dashboard}
+
+El DAG corre \texttt{@daily} con \texttt{catchup=False}, lo que significa que si el servicio
+estaba activo en una fecha fuera del rango del dataset (p.ej.\ la fecha actual en 2026),
+genera una fila en \texttt{kpi\_results} con valor 0 para todos los KPIs. Sin filtrar, el
+dashboard mostraba ``Valores más recientes: 0.00'' porque tomaba la fecha máxima del
+historial, que era hoy. La solución fue filtrar \texttt{reviews\_per\_day > 0} para determinar
+la última fecha real con datos, y ocultar en los gráficos las fechas con cero reseñas.
+
+%% ══════════════════════════════════════════════════════════════
 \section{Conclusiones}
 
 \begin{enumerate}
