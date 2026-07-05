@@ -52,6 +52,19 @@ def get_neo4j():
     return GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 
 
+@st.cache_data(ttl=300)
+def get_last_kpi_date() -> str:
+    try:
+        # Consultar solo la partición reviews_per_day y filtrar fechas con datos reales
+        rows = list(get_cassandra().execute(
+            "SELECT kpi_date, value FROM kpi_results WHERE kpi_name='reviews_per_day'"
+        ))
+        dates = [str(r.kpi_date) for r in rows if r.kpi_date and (r.value or 0) > 0]
+        return max(dates) if dates else ""
+    except Exception:
+        return ""
+
+
 # ── Sidebar ────────────────────────────────────────────────────────────────
 
 st.sidebar.image("https://upload.wikimedia.org/wikipedia/commons/a/ad/Yelp_Logo.svg", width=120)
@@ -60,11 +73,14 @@ st.sidebar.caption("Philadelphia, PA · UTEC 2026")
 st.sidebar.divider()
 st.sidebar.subheader("Filtros")
 ciudad_filtro = st.sidebar.text_input("Ciudad", "Philadelphia")
-min_stars = st.sidebar.slider("Rating mínimo", 1.0, 5.0, 4.0, 0.5)
+min_stars = st.sidebar.slider("Rating mínimo", 1.0, 5.0, 1.0, 0.5)
 top_n = st.sidebar.slider("Top N resultados", 5, 25, 10)
 st.sidebar.divider()
 st.sidebar.caption("Fuente: Yelp Open Dataset")
 st.sidebar.caption("Pipeline: Airflow @daily")
+_last_upd = get_last_kpi_date()
+if _last_upd:
+    st.sidebar.caption(f"Última actualización KPIs: {_last_upd}")
 
 
 # ── Header ────────────────────────────────────────────────────────────────
@@ -150,10 +166,23 @@ with tab_mongo:
             dist = get_stars_dist()
         if dist:
             df_dist = pd.DataFrame(dist).rename(columns={"_id": "estrellas", "total": "reseñas"})
-            fig2 = px.pie(df_dist, names="estrellas", values="reseñas",
-                          color_discrete_sequence=px.colors.sequential.RdBu,
-                          title="¿Cómo califican los usuarios?")
+            df_dist["estrellas_str"] = df_dist["estrellas"].astype(str)
+            fig2 = px.bar(
+                df_dist, x="estrellas_str", y="reseñas",
+                color="estrellas_str",
+                color_discrete_map={"1.0": "#e74c3c", "2.0": "#e67e22", "3.0": "#f1c40f", "4.0": "#2ecc71", "5.0": "#27ae60"},
+                title="Distribución de calificaciones — curva bimodal de Yelp",
+                labels={"estrellas_str": "Estrellas", "reseñas": "N° reseñas"},
+            )
+            fig2.update_layout(showlegend=False)
             st.plotly_chart(fig2, use_container_width=True)
+            _tot = df_dist["reseñas"].sum()
+            _ext = df_dist[df_dist["estrellas"].isin([1.0, 5.0])]["reseñas"].sum()
+            if _tot > 0:
+                st.caption(
+                    f"Distribución bimodal: el {_ext/_tot*100:.0f}% de las reseñas son 1★ o 5★. "
+                    f"Los usuarios de Yelp tienden a escribir solo cuando la experiencia es extrema."
+                )
         else:
             st.info("Sin reseñas en MongoDB. Ejecuta el DAG o bulk_ingest.py")
 
@@ -178,6 +207,40 @@ with tab_mongo:
             fig3.update_layout(yaxis={"categoryorder": "total ascending"})
             st.plotly_chart(fig3, use_container_width=True)
 
+    # Hidden Gems
+    st.subheader("💎 Hidden Gems — Alta calidad, bajo volumen")
+    @st.cache_data(ttl=300)
+    def get_hidden_gems(ciudad: str, n: int):
+        f = {"stars": {"$gte": 4.5}, "review_count": {"$gte": 5, "$lt": 50}}
+        if ciudad:
+            f["city"] = {"$regex": ciudad, "$options": "i"}
+        return list(get_mongo().businesses.find(
+            f, {"name": 1, "stars": 1, "review_count": 1, "categories": 1}
+        ).sort("stars", -1).limit(n))
+
+    with st.spinner("Buscando hidden gems..."):
+        gems = get_hidden_gems(ciudad_filtro, top_n)
+    if gems:
+        df_gems = pd.DataFrame(gems)
+        df_gems["categoría"] = df_gems["categories"].apply(
+            lambda x: x[0] if isinstance(x, list) and x else "Otra"
+        )
+        fig_gems = px.scatter(
+            df_gems, x="review_count", y="stars",
+            hover_name="name", color="categoría", size="stars",
+            labels={"review_count": "N° de reseñas", "stars": "Rating"},
+            title=f"Negocios ≥ 4.5★ con menos de 50 reseñas — {ciudad_filtro}",
+        )
+        fig_gems.add_vline(x=25, line_dash="dash", line_color="gray", opacity=0.4,
+                           annotation_text="25 reseñas")
+        st.plotly_chart(fig_gems, use_container_width=True)
+        st.caption(
+            f"{len(gems)} negocios encontrados — alta calificación pero poco descubiertos. "
+            f"Potenciales recomendaciones de nicho en Philadelphia."
+        )
+    else:
+        st.info("Sin hidden gems con los filtros actuales.")
+
     # Mapa geográfico
     st.subheader("🗺️ Mapa de negocios")
     @st.cache_data(ttl=300)
@@ -193,22 +256,35 @@ with tab_mongo:
             f, {"name": 1, "stars": 1, "latitude": 1, "longitude": 1, "categories": 1, "review_count": 1}
         ).limit(800))
 
+    @st.cache_data(ttl=300)
+    def get_geo_counts(ciudad: str):
+        f_base = {"city": {"$regex": ciudad, "$options": "i"}} if ciudad else {}
+        total = get_mongo().businesses.count_documents(f_base)
+        f_geo = {**f_base, "latitude": {"$exists": True, "$ne": None}, "longitude": {"$exists": True, "$ne": None}}
+        with_geo = get_mongo().businesses.count_documents(f_geo)
+        return total, with_geo
+
     with st.spinner("Cargando mapa..."):
         geo_data = get_biz_geo(min_stars, ciudad_filtro)
+        _total_biz, _with_geo = get_geo_counts(ciudad_filtro)
+    _pct_geo = int(_with_geo * 100 / _total_biz) if _total_biz > 0 else 0
+    st.caption(f"📍 {_with_geo:,} de {_total_biz:,} negocios en {ciudad_filtro} tienen coordenadas válidas ({_pct_geo}%)")
     if geo_data:
         df_geo = pd.DataFrame(geo_data)
         df_geo = df_geo.dropna(subset=["latitude", "longitude"])
         df_geo["categoría"] = df_geo["categories"].apply(
             lambda x: x[0] if isinstance(x, list) and x else "Otra"
         )
+        _star_min = float(df_geo["stars"].min())
+        _star_max = float(df_geo["stars"].max())
         fig_map = px.scatter_mapbox(
             df_geo, lat="latitude", lon="longitude",
             color="stars", hover_name="name",
             hover_data={"latitude": False, "longitude": False, "review_count": True, "categoría": True},
-            color_continuous_scale="RdYlGn", range_color=[1, 5],
+            color_continuous_scale="RdYlGn", range_color=[_star_min, _star_max],
             size="review_count", size_max=15,
             zoom=11, mapbox_style="open-street-map",
-            title=f"Negocios en {ciudad_filtro} (rating ≥ {min_stars}★)",
+            title=f"Negocios en {ciudad_filtro} — rating {_star_min:.1f}–{_star_max:.1f}★",
         )
         fig_map.update_layout(height=500, margin={"r": 0, "t": 40, "l": 0, "b": 0})
         st.plotly_chart(fig_map, use_container_width=True)
@@ -267,50 +343,75 @@ with tab_cassandra:
             rows = get_cassandra().execute(
                 "SELECT review_date, total FROM daily_review_counts"
             )
+            # Excluir fechas sin reviews reales (DAG corrió pero dataset no llega a esa fecha)
             return pd.DataFrame([
-                {"fecha": str(r.review_date), "reseñas": r.total} for r in rows
+                {"fecha": str(r.review_date), "reseñas": r.total}
+                for r in rows if (r.total or 0) > 0
             ]).sort_values("fecha")
 
         with st.spinner("Consultando Cassandra..."):
             df_daily = get_daily()
 
         if not df_daily.empty:
-            # Barra + línea de tendencia
-            fig4 = go.Figure()
-            fig4.add_trace(go.Bar(
-                x=df_daily["fecha"], y=df_daily["reseñas"],
-                name="Reseñas/día",
-                marker_color=df_daily["reseñas"],
-                marker_colorscale="Blues",
-            ))
-            # Tendencia lineal manual
-            if len(df_daily) >= 3:
-                x_num = list(range(len(df_daily)))
-                y_vals = df_daily["reseñas"].tolist()
-                n = len(x_num)
-                mean_x = sum(x_num) / n
-                mean_y = sum(y_vals) / n
-                slope = sum((x - mean_x) * (y - mean_y) for x, y in zip(x_num, y_vals)) / \
-                        max(sum((x - mean_x) ** 2 for x in x_num), 1e-9)
-                intercept = mean_y - slope * mean_x
-                trend = [slope * x + intercept for x in x_num]
-                fig4.add_trace(go.Scatter(
-                    x=df_daily["fecha"], y=trend,
-                    mode="lines", name="Tendencia",
-                    line=dict(color="#E63946", dash="dash", width=2),
-                ))
-            fig4.update_layout(
-                title="Volumen diario de reseñas procesadas",
-                xaxis_title="Fecha", yaxis_title="Reseñas",
-                legend=dict(orientation="h", y=1.1),
-            )
-            st.plotly_chart(fig4, use_container_width=True)
+            df_daily["fecha_dt"] = pd.to_datetime(df_daily["fecha"])
+            _min_d = df_daily["fecha_dt"].min().date()
+            _max_d = df_daily["fecha_dt"].max().date()
+            _default_start = max(_min_d, (_max_d - timedelta(days=365)))
 
-            if len(df_daily) >= 2:
-                ultimo = df_daily.iloc[-1]["reseñas"]
-                penultimo = df_daily.iloc[-2]["reseñas"]
-                delta = ((ultimo - penultimo) / penultimo * 100) if penultimo else 0
-                st.metric("Último día procesado", f"{ultimo:,} reseñas", f"{delta:+.1f}% vs día anterior")
+            _dcol1, _dcol2 = st.columns(2)
+            with _dcol1:
+                _start_d = st.date_input("Desde", value=_default_start, min_value=_min_d, max_value=_max_d, key="daily_start")
+            with _dcol2:
+                _end_d = st.date_input("Hasta", value=_max_d, min_value=_min_d, max_value=_max_d, key="daily_end")
+
+            _mask = (df_daily["fecha_dt"].dt.date >= _start_d) & (df_daily["fecha_dt"].dt.date <= _end_d)
+            df_plot = df_daily[_mask].copy()
+
+            if df_plot.empty:
+                st.warning("Sin datos en el rango seleccionado.")
+            else:
+                fig4 = go.Figure()
+                fig4.add_trace(go.Bar(
+                    x=df_plot["fecha"], y=df_plot["reseñas"],
+                    name="Reseñas/día",
+                    marker_color=df_plot["reseñas"],
+                    marker_colorscale="Blues",
+                ))
+                if len(df_plot) >= 3:
+                    x_num = list(range(len(df_plot)))
+                    y_vals = df_plot["reseñas"].tolist()
+                    n = len(x_num)
+                    mean_x = sum(x_num) / n
+                    mean_y = sum(y_vals) / n
+                    slope = sum((x - mean_x) * (y - mean_y) for x, y in zip(x_num, y_vals)) / \
+                            max(sum((x - mean_x) ** 2 for x in x_num), 1e-9)
+                    intercept = mean_y - slope * mean_x
+                    trend = [slope * x + intercept for x in x_num]
+                    fig4.add_trace(go.Scatter(
+                        x=df_plot["fecha"], y=trend,
+                        mode="lines", name="Tendencia",
+                        line=dict(color="#E63946", dash="dash", width=2),
+                    ))
+                fig4.update_layout(
+                    title=f"Volumen diario de reseñas ({_start_d} → {_end_d})",
+                    xaxis_title="Fecha", yaxis_title="Reseñas",
+                    legend=dict(orientation="h", y=1.1),
+                )
+                from datetime import date as _date
+                if _start_d <= _date(2020, 3, 1) <= _end_d:
+                    fig4.add_vline(
+                        x="2020-03-01", line_dash="dash", line_color="#e74c3c", opacity=0.8,
+                        annotation_text="COVID-19 (Mar 2020)",
+                        annotation_position="top right",
+                        annotation_font_color="#e74c3c",
+                    )
+                st.plotly_chart(fig4, use_container_width=True)
+
+                if len(df_plot) >= 2:
+                    ultimo = df_plot.iloc[-1]["reseñas"]
+                    penultimo = df_plot.iloc[-2]["reseñas"]
+                    delta = ((ultimo - penultimo) / penultimo * 100) if penultimo else 0
+                    st.metric("Último día en rango", f"{ultimo:,} reseñas", f"{delta:+.1f}% vs día anterior")
         else:
             st.info("Ejecuta el DAG para ver datos. Si ya corriste el pipeline, puede tardar unos minutos.")
 
@@ -333,13 +434,15 @@ with tab_cassandra:
             df_cats = get_cat_stats()
 
         if not df_cats.empty:
-            df_top = (df_cats.groupby("categoría")
-                      .agg(avg_stars=("avg_stars", "mean"),
-                           avg_sentiment=("avg_sentiment", "mean"),
-                           reseñas=("reseñas", "sum"))
-                      .reset_index()
-                      .sort_values("reseñas", ascending=False)
-                      .head(15))
+            _w = df_cats.copy()
+            _w["_sw"] = _w["avg_stars"]     * _w["reseñas"]
+            _w["_ew"] = _w["avg_sentiment"] * _w["reseñas"]
+            df_top = (_w.groupby("categoría")
+                       .agg(_sw=("_sw", "sum"), _ew=("_ew", "sum"), reseñas=("reseñas", "sum"))
+                       .reset_index())
+            df_top["avg_stars"]     = df_top["_sw"] / df_top["reseñas"].clip(lower=1)
+            df_top["avg_sentiment"] = df_top["_ew"] / df_top["reseñas"].clip(lower=1)
+            df_top = df_top.drop(columns=["_sw", "_ew"]).sort_values("reseñas", ascending=False).head(15)
             fig5 = px.scatter(
                 df_top, x="avg_stars", y="avg_sentiment",
                 size="reseñas", color="avg_stars",
@@ -356,10 +459,15 @@ with tab_cassandra:
 
     st.subheader("🔥 Análisis de sentimiento por categoría")
     if not df_cats.empty:
-        df_sent = (df_cats.groupby("categoría")["avg_sentiment"]
-                   .mean().reset_index()
-                   .sort_values("avg_sentiment", ascending=False)
-                   .head(top_n))
+        _sc = df_cats.copy()
+        _sc["_ew"] = _sc["avg_sentiment"] * _sc["reseñas"]
+        df_sent = (_sc.groupby("categoría")
+                     .agg(_ew=("_ew", "sum"), reseñas=("reseñas", "sum"))
+                     .reset_index())
+        df_sent["avg_sentiment"] = df_sent["_ew"] / df_sent["reseñas"].clip(lower=1)
+        df_sent = (df_sent.drop(columns=["_ew"])
+                          .sort_values("avg_sentiment", ascending=False)
+                          .head(top_n))
         df_sent["color"] = df_sent["avg_sentiment"].apply(
             lambda x: "positivo" if x > 0 else "negativo"
         )
@@ -488,6 +596,14 @@ with tab_neo4j:
             )
             st.plotly_chart(fig_net, use_container_width=True)
             st.caption(f"Nodos = usuarios (tamaño proporcional a conexiones) · {len(net_edges)} aristas mostradas entre el top {n}")
+            _degs = sorted(u["deg"] for u in net_nodes)
+            _max_deg = _degs[-1]
+            _med_deg = _degs[len(_degs) // 2]
+            _ratio = _max_deg // max(_med_deg, 1)
+            st.caption(
+                f"El usuario más conectado tiene {_max_deg:,} amigos vs {_med_deg:,} del usuario mediano "
+                f"del top {n} (ratio {_ratio}×). Distribución power-law característica de redes sociales reales."
+            )
         else:
             st.info("Sin datos de red. Ejecuta el DAG o `bulk_ingest.py` para cargar aristas REVIEWED.")
 
@@ -569,6 +685,57 @@ with tab_neo4j:
                 st.write("**Negocios recomendados por su red:**")
                 st.dataframe(df_biz_user, use_container_width=True)
 
+        st.divider()
+        st.subheader("📊 Red social vs ranking global — ¿descubre negocios distintos?")
+
+        @st.cache_data(ttl=300)
+        def get_net_vs_global(n: int):
+            with get_neo4j().session() as s:
+                net_rows = list(s.run("""
+                    MATCH (:User)-[:FRIEND]->(:User)-[:REVIEWED]->(b:Business)
+                    RETURN b.name AS negocio, count(*) AS menciones_red
+                    ORDER BY menciones_red DESC LIMIT $n
+                """, n=n))
+                glob_rows = list(s.run("""
+                    MATCH (:User)-[:REVIEWED]->(b:Business)
+                    RETURN b.name AS negocio, count(*) AS resenas_global
+                    ORDER BY resenas_global DESC LIMIT $n
+                """, n=n))
+            df_red  = pd.DataFrame([{"negocio": r["negocio"], "menciones_red":  r["menciones_red"]}  for r in net_rows])
+            df_glob = pd.DataFrame([{"negocio": r["negocio"], "resenas_global": r["resenas_global"]} for r in glob_rows])
+            if df_red.empty or df_glob.empty:
+                return pd.DataFrame()
+            return df_red.merge(df_glob, on="negocio", how="outer").fillna(0)
+
+        with st.spinner("Comparando popularidad en red vs global..."):
+            df_comp = get_net_vs_global(top_n)
+
+        if not df_comp.empty:
+            df_comp["tipo"] = df_comp.apply(
+                lambda r: "En ambos"   if r["menciones_red"] > 0 and r["resenas_global"] > 0
+                else ("Solo en red"    if r["menciones_red"] > 0
+                else  "Solo global"),
+                axis=1,
+            )
+            fig_comp = px.scatter(
+                df_comp, x="resenas_global", y="menciones_red",
+                text="negocio", color="tipo",
+                color_discrete_map={"En ambos": "#3498db", "Solo en red": "#e74c3c", "Solo global": "#2ecc71"},
+                labels={"resenas_global": "Reseñas totales (global)", "menciones_red": "Menciones en red social"},
+                title="¿La red del influencer descubre negocios distintos al ranking general?",
+            )
+            fig_comp.update_traces(textposition="top center", textfont_size=8)
+            st.plotly_chart(fig_comp, use_container_width=True)
+            _solo_red = df_comp[df_comp["tipo"] == "Solo en red"]["negocio"].tolist()
+            if _solo_red:
+                st.caption(
+                    f"Negocios exclusivos de la red (no en ranking global): "
+                    f"{', '.join(_solo_red[:3])}{'...' if len(_solo_red) > 3 else ''}. "
+                    f"La red actúa como descubridor de nichos."
+                )
+        else:
+            st.info("Sin datos suficientes para la comparativa.")
+
     except Exception as e:
         st.error(f"Neo4j no disponible: {e}")
 
@@ -582,12 +749,15 @@ with tab_kpis:
     st.caption("Calculados automáticamente en la etapa `generate_kpis` del DAG `yelp_pipeline`")
 
     KPI_META = {
-        "reviews_per_day":        ("Reseñas procesadas/día",          "Volumen de reseñas que procesó el pipeline en cada ejecución diaria."),
-        "daily_growth_pct":       ("Crecimiento diario (%)",           "Variación porcentual del volumen de reseñas respecto al día anterior."),
-        "top_category_avg_stars": ("Rating promedio (top categoría)",  "Rating promedio de la categoría mejor puntuada ese día."),
-        "top_influencer_degree":  ("Grado del influencer top",         "Número de amigos directos del usuario más conectado en la red social."),
-        "top_business_network":   ("Menciones del top negocio en red", "Cuántas veces fue reseñado el negocio más popular dentro de la red social."),
-        "avg_sentiment":          ("Sentimiento promedio VADER",       "Índice de sentimiento medio de las reseñas del día (-1 negativo, +1 positivo)."),
+        "reviews_per_day":            ("Reseñas procesadas/día",          "Volumen de reseñas que procesó el pipeline en cada ejecución diaria."),
+        "daily_growth_pct":           ("Crecimiento diario (%)",           "Variación porcentual del volumen de reseñas respecto al día anterior."),
+        "top_category_avg_stars":     ("Mejor categoría del día (★)",      "Categoría con mayor rating promedio ese día (mín. 3 reseñas). Cambia a diario según qué nicho brilló más."),
+        "active_categories":          ("Categorías activas",               "Número de tipos de negocio distintos con al menos una reseña ese día. Mide la diversidad de actividad comercial."),
+        "avg_stars_of_day":           ("Rating promedio ponderado",        "Media ponderada de stars de todas las categorías ese día. Índice global de calidad diario."),
+        "avg_sentiment":              ("Sentimiento promedio VADER",       "Índice de sentimiento medio de las reseñas del día (–1 negativo → +1 positivo)."),
+        "top_category_quality_score": ("Score calidad×volumen (cat. top)", "Categoría con mejor score stars×(sentiment+1)×reviews ese día."),
+        "pct_high_rated_categories":  ("% categorías ≥4★",                 "Porcentaje de categorías activas ese día con rating promedio ≥ 4.0 estrellas."),
+        "pct_positive_categories":    ("% categorías sentim. positivo",    "% de categorías con sentimiento VADER > 0.1 ese día."),
     }
 
     @st.cache_data(ttl=60)
@@ -608,12 +778,30 @@ with tab_kpis:
     if df_kpi.empty:
         st.info("Sin KPIs todavía. Ejecuta el DAG al menos una vez.")
     else:
-        ultima_fecha = df_kpi["fecha"].max()
-        penultima_fecha = df_kpi[df_kpi["fecha"] < ultima_fecha]["fecha"].max() if len(df_kpi["fecha"].unique()) > 1 else None
+        # Usar la fecha más reciente con reviews reales (evita mostrar fechas del DAG
+        # que corrieron fuera del rango del dataset Yelp, donde todo vale 0)
+        _rpd = df_kpi[df_kpi["kpi"] == "reviews_per_day"]
+        _fechas_reales = _rpd[_rpd["valor"] > 0]["fecha"]
+        ultima_fecha = _fechas_reales.max() if not _fechas_reales.empty else df_kpi["fecha"].max()
+        _fechas_prev = _fechas_reales[_fechas_reales < ultima_fecha]
+        penultima_fecha = _fechas_prev.max() if not _fechas_prev.empty else None
 
         st.subheader(f"Valores más recientes — {ultima_fecha}")
         ultimos = df_kpi[df_kpi["fecha"] == ultima_fecha].set_index("kpi")
         anteriores = df_kpi[df_kpi["fecha"] == penultima_fecha].set_index("kpi") if penultima_fecha else None
+
+        # KPIs que ya son porcentajes o escalas acotadas: delta como diferencia absoluta (pp / puntos)
+        # KPIs que ya son tasas de cambio: sin delta (mostrar el cambio de un cambio es confuso)
+        _NO_DELTA   = {"daily_growth_pct"}
+        _ABS_DELTA  = {"avg_sentiment", "avg_stars_of_day", "top_category_avg_stars",
+                       "pct_high_rated_categories", "pct_positive_categories"}
+        _DELTA_UNIT = {
+            "avg_sentiment":           "pts",
+            "avg_stars_of_day":        "★",
+            "top_category_avg_stars":  "★",
+            "pct_high_rated_categories": "pp",
+            "pct_positive_categories":   "pp",
+        }
 
         cols = st.columns(3)
         for i, (kpi_id, (nombre, desc)) in enumerate(KPI_META.items()):
@@ -622,15 +810,85 @@ with tab_kpis:
                     val = ultimos.loc[kpi_id, "valor"]
                     det = ultimos.loc[kpi_id, "detalle"] or ""
                     delta_str = None
-                    if anteriores is not None and kpi_id in anteriores.index:
+                    if kpi_id not in _NO_DELTA and anteriores is not None and kpi_id in anteriores.index:
                         prev_val = anteriores.loc[kpi_id, "valor"]
-                        if prev_val != 0:
-                            delta_str = f"{((val - prev_val) / abs(prev_val) * 100):+.1f}% vs {penultima_fecha}"
+                        diff = val - prev_val
+                        if kpi_id in _ABS_DELTA:
+                            unit = _DELTA_UNIT.get(kpi_id, "")
+                            delta_str = f"{diff:+.2f}{unit} vs {penultima_fecha}"
+                        elif prev_val != 0:
+                            delta_str = f"{(diff / abs(prev_val) * 100):+.1f}% vs {penultima_fecha}"
                     st.metric(label=nombre, value=f"{val:,.2f}", delta=delta_str, help=desc)
                     if det:
                         st.caption(f"Detalle: {det}")
                 else:
                     st.metric(label=nombre, value="—", help=desc)
+
+        st.divider()
+
+        # ── Insights estructurales de la red (Neo4j) — estáticos ────────────
+        st.subheader("🔗 Insights estructurales de la red (Neo4j)")
+        st.caption("Métricas calculadas sobre el grafo completo. No varían por fecha — representan la estructura de la red social de Yelp en Philadelphia.")
+
+        @st.cache_data(ttl=3600)
+        def get_structural_insights() -> dict:
+            try:
+                driver = get_neo4j()
+                out: dict = {}
+                with driver.session() as s:
+                    r = s.run(
+                        "MATCH (u:User)-[:FRIEND]->(f:User) "
+                        "RETURN coalesce(u.name,'') AS name, u.user_id AS uid, count(f) AS deg "
+                        "ORDER BY deg DESC LIMIT 1"
+                    ).single()
+                    if r:
+                        out["inf_name"] = r["name"] or r["uid"][:8]
+                        out["inf_deg"]  = int(r["deg"])
+                    r2 = s.run(
+                        "MATCH (u:User)-[:REVIEWED]->(b:Business) "
+                        "RETURN b.name AS bname, count(*) AS cnt "
+                        "ORDER BY cnt DESC LIMIT 1"
+                    ).single()
+                    if r2:
+                        out["biz_name"] = r2["bname"] or "—"
+                        out["biz_cnt"]  = int(r2["cnt"])
+                    r3 = s.run("MATCH ()-[r:FRIEND]->() RETURN count(r) AS c").single()
+                    if r3:
+                        out["total_friends"] = int(r3["c"])
+                    r4 = s.run("MATCH ()-[r:REVIEWED]->() RETURN count(r) AS c").single()
+                    if r4:
+                        out["total_reviewed"] = int(r4["c"])
+                return out
+            except Exception as exc:
+                return {"error": str(exc)}
+
+        si = get_structural_insights()
+        if "error" in si:
+            st.warning(f"Neo4j no disponible: {si['error']}")
+        else:
+            sc1, sc2, sc3, sc4 = st.columns(4)
+            sc1.metric(
+                "Usuario más influyente",
+                si.get("inf_name", "—"),
+                help="Usuario con más conexiones FRIEND directas en el grafo Neo4j",
+            )
+            sc1.caption(f"{si.get('inf_deg', 0):,} amigos directos")
+            sc2.metric(
+                "Negocio más reseñado en la red",
+                si.get("biz_name", "—"),
+                help="Negocio con más aristas REVIEWED apuntando a él en Neo4j",
+            )
+            sc2.caption(f"{si.get('biz_cnt', 0):,} reseñas en la red")
+            sc3.metric(
+                "Conexiones FRIEND totales",
+                f"{si.get('total_friends', 0):,}",
+                help="Total de relaciones de amistad cargadas en el grafo",
+            )
+            sc4.metric(
+                "Relaciones REVIEWED totales",
+                f"{si.get('total_reviewed', 0):,}",
+                help="Total de aristas Usuario→Negocio por reseña en el grafo",
+            )
 
         st.divider()
         st.subheader("Evolución temporal de KPIs")
@@ -640,6 +898,11 @@ with tab_kpis:
             format_func=lambda k: KPI_META[k][0],
         )
         df_sel = df_kpi[df_kpi["kpi"] == kpi_sel].sort_values("fecha")
+        # Excluir fechas donde reviews_per_day=0 (DAG corrió fuera del rango del dataset)
+        _zero_dates = set(
+            df_kpi[(df_kpi["kpi"] == "reviews_per_day") & (df_kpi["valor"] == 0)]["fecha"]
+        )
+        df_sel = df_sel[~df_sel["fecha"].isin(_zero_dates)]
         if not df_sel.empty:
             fig9 = px.line(
                 df_sel, x="fecha", y="valor", markers=True,
@@ -653,7 +916,16 @@ with tab_kpis:
         st.divider()
         st.subheader("📋 Tabla comparativa de KPIs por fecha")
 
-        pivot = df_kpi.pivot_table(index="kpi", columns="fecha", values="valor", aggfunc="mean")
+        _all_fechas = sorted(df_kpi["fecha"].unique())
+        _max_cols = st.slider(
+            "Últimas N fechas en la tabla",
+            min_value=3, max_value=min(30, len(_all_fechas)),
+            value=min(14, len(_all_fechas)), key="pivot_n",
+        )
+        _fechas_pivot = _all_fechas[-_max_cols:]
+        df_pivot_data = df_kpi[df_kpi["fecha"].isin(_fechas_pivot)]
+
+        pivot = df_pivot_data.pivot_table(index="kpi", columns="fecha", values="valor", aggfunc="mean")
         pivot.index = pivot.index.map(lambda k: KPI_META.get(k, (k,))[0])
 
         def color_delta(val):

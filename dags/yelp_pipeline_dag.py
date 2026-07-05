@@ -195,4 +195,4 @@ with DAG(
     load_neo4j     = PythonOperator(task_id="build_load_neo4j",         python_callable=task_load_neo4j)
     gen_kpis       = PythonOperator(task_id="generate_kpis",            python_callable=task_generate_kpis)
 
-    extract >> validate >> load_mongo >> [load_cassandra, load_neo4j] >> gen_kpis
+    extract >> validate >> [load_mongo, load_cassandra, load_neo4j] >> gen_kpis

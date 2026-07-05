@@ -5,8 +5,12 @@ Complementa el DAG (que hace cargas incrementales diarias).
 
 Uso:
     python scripts/bulk_ingest.py
-    python scripts/bulk_ingest.py --limit 50000   # subset para pruebas
-    python scripts/bulk_ingest.py --skip-mongo    # solo Cassandra + Neo4j
+    python scripts/bulk_ingest.py --limit 50000           # subset para pruebas
+    python scripts/bulk_ingest.py --skip-mongo            # solo Cassandra + Neo4j
+    python scripts/bulk_ingest.py --reserve-dates 2019-01-28,2019-01-29
+        # Deja esas fechas sin cargar en Cassandra/KPIs para usarlas como
+        # demo del DAG Airflow (MongoDB y Neo4j sí se cargan siempre).
+        # Puedes agregar más fechas separadas por coma.
 """
 from __future__ import annotations
 import json
@@ -29,10 +33,19 @@ _vader = SentimentIntensityAnalyzer()
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--limit",       type=int, default=0,     help="Máx reviews a procesar (0 = todos)")
-    p.add_argument("--skip-mongo",  action="store_true",     help="Omitir carga a MongoDB")
+    p.add_argument("--limit",          type=int, default=0,  help="Máx reviews a procesar (0 = todos)")
+    p.add_argument("--skip-mongo",     action="store_true",  help="Omitir carga a MongoDB")
     p.add_argument("--skip-cassandra", action="store_true",  help="Omitir carga a Cassandra")
-    p.add_argument("--skip-neo4j",  action="store_true",     help="Omitir carga a Neo4j")
+    p.add_argument("--skip-neo4j",     action="store_true",  help="Omitir carga a Neo4j")
+    p.add_argument(
+        "--reserve-dates",
+        default="2019-01-28,2019-01-29",
+        help=(
+            "Fechas separadas por coma a excluir de Cassandra (quedan limpias para "
+            "demo del DAG). Pasar '' para no reservar ninguna. "
+            "Default: 2019-01-28,2019-01-29"
+        ),
+    )
     return p.parse_args()
 
 
@@ -116,8 +129,11 @@ def ingest_mongo(reviews: list[dict]):
     log.info("MongoDB: %d operaciones en %.1fs", total, time.perf_counter() - t0)
 
 
-def ingest_cassandra(reviews: list[dict], biz_cats: dict):
+def ingest_cassandra(reviews: list[dict], biz_cats: dict, reserve: set[str] | None = None):
+    reserve = reserve or set()
     log.info("=== Cassandra: procesando %d reviews por fecha ===", len(reviews))
+    if reserve:
+        log.info("  Fechas reservadas (excluidas): %s", sorted(reserve))
     t0 = time.perf_counter()
 
     by_date: dict[str, list] = defaultdict(list)
@@ -125,16 +141,25 @@ def ingest_cassandra(reviews: list[dict], biz_cats: dict):
         if r.get("date"):
             by_date[r["date"]].append(r)
 
-    log.info("Fechas distintas: %d", len(by_date))
+    log.info("Fechas distintas en el sample: %d", len(by_date))
+    loaded, skipped_reserved = 0, 0
     for ds, day_reviews in sorted(by_date.items()):
+        if ds in reserve:
+            log.info("  [RESERVADA] %s — %d reviews omitidas de Cassandra", ds, len(day_reviews))
+            skipped_reserved += 1
+            continue
         try:
             cassandra_loader.upsert_reviews_by_business(day_reviews)
             cassandra_loader.upsert_daily_counts(ds, day_reviews)
             cassandra_loader.upsert_category_stats(ds, day_reviews, biz_cats)
+            loaded += 1
         except Exception as e:
             log.error("Cassandra error en %s: %s", ds, e)
 
-    log.info("Cassandra: %d fechas procesadas en %.1fs", len(by_date), time.perf_counter() - t0)
+    log.info(
+        "Cassandra: %d fechas cargadas | %d reservadas para demo | %.1fs",
+        loaded, skipped_reserved, time.perf_counter() - t0,
+    )
 
 
 def ingest_neo4j(reviews: list[dict]):
@@ -148,7 +173,16 @@ def ingest_neo4j(reviews: list[dict]):
 
 def main():
     args = parse_args()
+    reserve: set[str] = (
+        {d.strip() for d in args.reserve_dates.split(",") if d.strip()}
+        if args.reserve_dates else set()
+    )
+
     log.info("=== BULK INGEST iniciado ===")
+    if reserve:
+        log.info("Fechas reservadas para demo Airflow: %s", sorted(reserve))
+        log.info("  → Esas fechas se cargan en MongoDB y Neo4j pero NO en Cassandra/KPIs.")
+        log.info("  → Úsalas con: bash scripts/demo_airflow.sh --date YYYY-MM-DD")
 
     # Cargar mapa de categorías desde staging (ya limpio)
     biz_cats: dict[str, list] = {}
@@ -156,6 +190,13 @@ def main():
     for b in _iter_jsonl(staging / "businesses.jsonl"):
         biz_cats[b["business_id"]] = b.get("categories", [])
     log.info("biz_cats cargado: %d negocios", len(biz_cats))
+
+    if not biz_cats:
+        log.warning(
+            "biz_cats vacío — puede que data/staging/businesses.jsonl no exista. "
+            "Los category_stats de Cassandra no tendrán categorías. "
+            "Ejecuta el DAG al menos una vez (extract + validate_clean) para generarlo."
+        )
 
     reviews = load_all_reviews(args)
     if not reviews:
@@ -166,12 +207,17 @@ def main():
         ingest_mongo(reviews)
 
     if not args.skip_cassandra:
-        ingest_cassandra(reviews, biz_cats)
+        ingest_cassandra(reviews, biz_cats, reserve)
 
     if not args.skip_neo4j:
         ingest_neo4j(reviews)
 
     log.info("=== BULK INGEST completado ===")
+    if reserve:
+        log.info("")
+        log.info("Fechas disponibles para demo del DAG:")
+        for d in sorted(reserve):
+            log.info("  bash scripts/demo_airflow.sh --date %s", d)
 
 
 if __name__ == "__main__":
