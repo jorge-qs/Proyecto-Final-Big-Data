@@ -41,20 +41,17 @@ RAW JSON (Yelp)
       ▼
 [ validate_clean ]  ← VADER NLP aplicado al texto de reviews
       │
-      ├──────────────────────────────────┐
-      │                                  │
-      ▼                                  ▼
-[ load_mongo ]              [ transform_load_cassandra ]
-      │                                  │
-      └──────────┬───────────────────────┘
-                 │
-         [ build_load_neo4j ]
-                 │
-                 ▼
-         [ generate_kpis ]
-                 │
-                 ▼
-         [ Dashboard Streamlit ]
+      ├─────────────────────┬──────────────────────────┐
+      │                     │                          │
+      ▼                     ▼                          ▼
+[ load_mongo ]  [ transform_load_cassandra ]  [ build_load_neo4j ]
+      │                     │                          │
+      └─────────────────────┴──────────────────────────┘
+                            │
+                    [ generate_kpis ]
+                            │
+                            ▼
+                   [ Dashboard Streamlit ]
 ```
 
 El DAG `yelp_pipeline` corre `@daily` — cada ejecución procesa el día lógico `{{ ds }}` de forma **incremental e idempotente**. Los tres loaders (Mongo, Cassandra, Neo4j) corren en paralelo tras la limpieza.
