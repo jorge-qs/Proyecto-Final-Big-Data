@@ -68,32 +68,42 @@ fi
 
 # ── 3. Triggear el DAG para la fecha de demo ──────────────────────────────
 LOGICAL_DATE="${DEMO_DATE}T00:00:00+00:00"
+
+# Si ya existe un run para esa fecha, eliminarlo primero
+EXISTING_RUN_ID=$(curl -s -u "$AIRFLOW_USER:$AIRFLOW_PASS" \
+    "$AIRFLOW_URL/api/v1/dags/$DAG_ID/dagRuns?limit=100&order_by=-execution_date" 2>/dev/null | \
+    python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+runs=[r for r in d.get('dag_runs',[]) if r.get('logical_date','').startswith('$DEMO_DATE')]
+print(runs[0]['dag_run_id'] if runs else '')
+" 2>/dev/null || echo "")
+
+if [[ -n "$EXISTING_RUN_ID" ]]; then
+    warn "Existe un run previo para $DEMO_DATE ($EXISTING_RUN_ID). Eliminándolo para el demo..."
+    curl -s -X DELETE \
+        -u "$AIRFLOW_USER:$AIRFLOW_PASS" \
+        "$AIRFLOW_URL/api/v1/dags/$DAG_ID/dagRuns/$EXISTING_RUN_ID" > /dev/null
+    log "Run anterior eliminado"
+    sleep 2
+fi
+
+RUN_ID="manual_demo_${DEMO_DATE}_$(date +%s)"
 warn "Triggeando DAG para logical_date=$LOGICAL_DATE ..."
 
 TRIGGER_RESP=$(curl -s -X POST \
     -u "$AIRFLOW_USER:$AIRFLOW_PASS" \
     -H "Content-Type: application/json" \
-    -d "{\"logical_date\": \"$LOGICAL_DATE\"}" \
+    -d "{\"dag_run_id\": \"$RUN_ID\", \"logical_date\": \"$LOGICAL_DATE\"}" \
     "$AIRFLOW_URL/api/v1/dags/$DAG_ID/dagRuns" 2>/dev/null)
 
-RUN_ID=$(echo "$TRIGGER_RESP" | python3 -c \
+ACTUAL_RUN_ID=$(echo "$TRIGGER_RESP" | python3 -c \
     "import sys,json; d=json.load(sys.stdin); print(d.get('dag_run_id',''))" 2>/dev/null || echo "")
 
-if [[ -z "$RUN_ID" ]]; then
-    # Puede ser que ya exista un run para esa fecha — buscar el más reciente
-    warn "Trigger falló (posiblemente ya existe un run para $DEMO_DATE). Buscando el run activo..."
-    RUN_ID=$(curl -s -u "$AIRFLOW_USER:$AIRFLOW_PASS" \
-        "$AIRFLOW_URL/api/v1/dags/$DAG_ID/dagRuns?limit=5&order_by=-execution_date" 2>/dev/null | \
-        python3 -c "
-import sys,json
-d=json.load(sys.stdin)
-runs=[r for r in d.get('dag_runs',[]) if '$DEMO_DATE' in r.get('logical_date','')]
-print(runs[0]['dag_run_id'] if runs else '')
-" 2>/dev/null || echo "")
-fi
-
-if [[ -z "$RUN_ID" ]]; then
-    err "No se pudo obtener el run_id. Revisa Airflow en $AIRFLOW_URL"
+if [[ -n "$ACTUAL_RUN_ID" ]]; then
+    RUN_ID="$ACTUAL_RUN_ID"
+else
+    err "No se pudo crear el run. Respuesta: $(echo $TRIGGER_RESP | head -c 300). Revisa Airflow en $AIRFLOW_URL"
 fi
 log "DAG run creado: $RUN_ID"
 echo ""
