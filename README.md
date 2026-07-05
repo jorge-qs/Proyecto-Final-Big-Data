@@ -1,197 +1,188 @@
-# Proyecto Big Data — Arquitectura Multimodelo sobre Yelp Open Dataset
+# Arquitectura Multimodelo sobre el Yelp Open Dataset
 
-> **Fuente de verdad del equipo.** Léelo completo antes de tocar código. Cada
-> integrante tiene además un `.md` propio con su rol detallado.
+**UTEC — Big Data | Proyecto Grupal II | Julio 2026**
 
----
-
-## 1. Idea en una frase
-
-Tomamos **un solo dataset** (Yelp Open Dataset) y lo hacemos "viajar" por tres
-bases de datos que cumplen propósitos distintos sobre **los mismos datos**:
-MongoDB (documentos originales) → Cassandra (series temporales / agregados) →
-Neo4j (relaciones). Apache Airflow orquesta ese viaje de forma programada, y un
-dashboard en Streamlit muestra los KPIs.
-
-**No hay 5 datasets ni 5 sistemas. Hay UNO solo.** El dato se extrae y se limpia
-una vez, y de ahí fluye en cadena.
+> Un solo dataset. Tres bases de datos. Un pipeline orquestado con Airflow. Un dashboard en tiempo real.
 
 ---
 
-## 2. El dataset
+## Tecnologías
 
-**Yelp Open Dataset** (https://business.yelp.com/data/resources/open-dataset/).
-Uso educativo. 5 archivos JSON, **un objeto JSON por línea**:
+![Python](https://img.shields.io/badge/Python-3.11-blue?logo=python)
+![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker)
+![Airflow](https://img.shields.io/badge/Apache%20Airflow-2.8-017CEE?logo=apache-airflow)
+![MongoDB](https://img.shields.io/badge/MongoDB-7.0-47A248?logo=mongodb)
+![Cassandra](https://img.shields.io/badge/Cassandra-4.1-1287B1?logo=apache-cassandra)
+![Neo4j](https://img.shields.io/badge/Neo4j-5.x-008CC1?logo=neo4j)
+![Streamlit](https://img.shields.io/badge/Streamlit-1.x-FF4B4B?logo=streamlit)
 
-| Archivo | Contenido | ¿Para qué nos sirve? |
+---
+
+## Descripción
+
+Procesamos el **Yelp Open Dataset** (Philadelphia, PA) a través de tres bases de datos especializadas orquestadas por Apache Airflow:
+
+| Base de datos | Modelo | Caso de uso |
 |---|---|---|
-| `business.json` | Negocios: ubicación, `stars`, `review_count`, `attributes` (anidado y **variable**), `categories` (string separado por comas), `hours` | Documento rico → **MongoDB** |
-| `review.json` | `review_id`, `user_id`, `business_id`, `stars` (1–5), `useful/funny/cool`, `text`, `date` (millones de filas) | Documento + serie temporal → **MongoDB** y **Cassandra** |
-| `user.json` | `user_id`, `review_count`, `yelping_since`, **`friends` (lista de user_ids)**, `fans`, `average_stars` | Grafo social → **Neo4j** |
-| `checkin.json` | `business_id`, `date` (lista de timestamps separados por coma) | Serie temporal → **Cassandra** |
-| `tip.json` | `text`, `date`, `compliment_count`, `business_id`, `user_id` | Documento corto → **MongoDB** |
-
-### Alcance acordado (para que sea manejable y reproducible)
-- Filtramos a **una región** (ej. 1–2 áreas metropolitanas) o a una **categoría**
-  (ej. restaurantes) para no cargar 5 GB.
-- Objetivo: **≥ 50,000 reseñas** (el dataset las supera de sobra incluso filtrado).
-- **Enriquecimiento** (lo que nos hace destacar): sentimiento del texto de reseñas
-  (NLP simple), y particionado de reseñas por fecha para simular cargas incrementales.
-
-### Justificación técnica (¡obligatoria en el informe!)
-- **MongoDB** porque `attributes` varía de negocio a negocio (esquema flexible) y
-  los documentos son ricos y anidados.
-- **Cassandra** porque las reseñas y check-ins son eventos con marca de tiempo:
-  escrituras masivas, consultas por fecha, agregados. Modelo *query-first*.
-- **Neo4j** porque `friends` forma una red social real y queremos consultas de
-  relación (influencers, "negocios reseñados por mis amigos").
+| **MongoDB** | Documentos | Negocios con atributos variables, reviews, users, tips |
+| **Cassandra** | Series temporales | Conteos diarios, estadísticas por categoría, KPIs |
+| **Neo4j** | Grafo social | Red de amistades, influencia, traversals |
 
 ---
 
-## 3. Cómo nos repartimos (5 integrantes)
+## Arquitectura del pipeline
 
-**4 dueños "verticales" + 1 de integración.** Cada uno es dueño de su carpeta en el
-repo (minimiza conflictos de merge en GitHub).
+```
+RAW JSON (Yelp)
+      │
+      ▼
+  [ extract ]
+      │
+      ▼
+[ validate_clean ]  ← VADER NLP aplicado al texto de reviews
+      │
+      ├─────────────────────┬──────────────────────────┐
+      │                     │                          │
+      ▼                     ▼                          ▼
+[ load_mongo ]  [ transform_load_cassandra ]  [ build_load_neo4j ]
+      │                     │                          │
+      └─────────────────────┴──────────────────────────┘
+                            │
+                    [ generate_kpis ]
+                            │
+                            ▼
+                   [ Dashboard Streamlit ]
+```
 
-| # | Rol | Archivo de instrucciones | Carpeta que posee |
-|---|---|---|---|
-| 1 | **Data Engineer** (datos + extracción + limpieza) | `01_data_engineer.md` | `src/extract/`, `src/transform/`, `src/common/` |
-| 2 | **MongoDB** | `02_mongodb.md` | `src/loaders/mongo_loader.py`, `scripts/mongo_indexes.js` |
-| 3 | **Cassandra** | `03_cassandra.md` | `src/loaders/cassandra_loader.py`, `scripts/cassandra_schema.cql` |
-| 4 | **Neo4j** | `04_neo4j.md` | `src/loaders/neo4j_loader.py`, `scripts/neo4j_constraints.cypher` |
-| 5 | **Airflow + Dashboard + DevOps** | `05_airflow_dashboard.md` | `dags/`, `dashboard/`, `docker-compose.yml`, `src/kpis/` |
-
-> **La duda que más te preocupaba:** "¿cómo junto todo en Airflow sin rehacerlo?"
-> **No se rehace nada.** Cada dueño escribe su carga como **funciones de Python
-> reutilizables** (no como notebooks sueltos). El integrador solo las **importa** y
-> las conecta como tareas del DAG. Ver §6.
+El DAG `yelp_pipeline` corre `@daily` — cada ejecución procesa el día lógico `{{ ds }}` de forma **incremental e idempotente**. Los tres loaders (Mongo, Cassandra, Neo4j) corren en paralelo tras la limpieza.
 
 ---
 
-## 4. El "contrato de datos" (la clave de trabajar en paralelo)
+## Dataset
 
-El Data Engineer produce el **dato limpio canónico** en `data/staging/`, y **todos
-los demás consumen de ahí**. Mientras el contrato (nombres de campos y tipos) esté
-acordado, cada uno puede avanzar sin esperar al otro.
+**Yelp Open Dataset** — filtrado a Philadelphia, PA.
 
-Salida del Data Engineer — un archivo `.jsonl` por entidad (un objeto por línea),
-**particionado por fecha** donde aplique:
+| Entidad | Registros | Destino |
+|---|---|---|
+| Businesses | 14,567 | MongoDB + Neo4j |
+| Reviews | 200,000 | MongoDB + Cassandra |
+| Users | 98,138 | Neo4j (grafo social) |
+| Tips | 115,910 | MongoDB |
+| Check-ins | — | Cassandra |
 
-```
-data/staging/
-├── businesses.jsonl
-├── users.jsonl
-├── reviews/dt=YYYY-MM-DD/part.jsonl     # particionado por fecha (incremental)
-├── checkins/dt=YYYY-MM-DD/part.jsonl
-└── tips.jsonl
-```
-
-El esquema exacto de cada campo vive en `src/common/schema.py` (lo define el Data
-Engineer y es **inmutable sin avisar al equipo**). Esa es la frontera entre roles.
+Rango temporal: **2005-06-27 → 2022-01-19** (5,572 fechas distintas con reviews reales).
 
 ---
 
-## 5. Estructura del repositorio (GitHub)
+## Estructura del repositorio
 
 ```
-yelp-bigdata/
-├── docker-compose.yml          # levanta Mongo + Cassandra + Neo4j + Airflow
-├── .env.example                # credenciales de ejemplo (NO subir .env real)
+.
+├── docker-compose.yml          # Todos los servicios: MongoDB, Cassandra, Neo4j, Airflow
+├── start.sh / stop.sh          # Levantar y apagar el entorno
 ├── requirements.txt
-├── README.md                   # este archivo
-├── data/
-│   ├── raw/                    # JSON de Yelp (gitignored, muy pesado)
-│   └── staging/                # salida limpia del Data Engineer
+├── dags/
+│   └── yelp_pipeline_dag.py    # DAG principal de Airflow
 ├── src/
-│   ├── common/                 # contrato de datos: schema.py, config.py
-│   ├── extract/                # descarga / lectura del raw
-│   ├── transform/              # validación + limpieza + enriquecimiento
-│   ├── loaders/                # mongo_loader.py, cassandra_loader.py, neo4j_loader.py
-│   └── kpis/                   # compute_kpis.py
-├── scripts/                    # creación de BD: .js, .cql, .cypher
-├── dags/                       # yelp_pipeline_dag.py
-├── dashboard/                  # app.py (Streamlit)
-├── tests/
-└── docs/report_assets/         # capturas y material del informe
+│   ├── common/                 # config.py, schema.py
+│   ├── extract/                # Verificación de archivos raw
+│   ├── transform/              # Limpieza, validación, VADER NLP
+│   ├── loaders/                # mongo_loader.py · cassandra_loader.py · neo4j_loader.py
+│   └── kpis/                   # compute_kpis.py — 9 KPIs dinámicos
+├── scripts/
+│   ├── cassandra_schema.cql    # DDL del keyspace yelp_analytics
+│   ├── neo4j_constraints.cypher
+│   ├── mongo_indexes.js
+│   ├── demo_airflow.sh         # Demo del pipeline en vivo (triggea el DAG + polling)
+│   └── trigger_date.py         # Triggea el DAG para una fecha específica
+├── dashboard/
+│   └── app.py                  # Streamlit — 4 tabs: MongoDB · Cassandra · Neo4j · KPIs
+├── data/
+│   ├── raw/                    # JSON de Yelp (gitignored)
+│   └── staging/                # JSONL particionado por fecha (gitignored)
+└── informe/
+    └── informe.pdf             # Informe técnico completo
 ```
-
-### Reglas de GitHub
-- `main` protegida. Cada uno trabaja en su rama: `feature/mongo`, `feature/cassandra`, etc.
-- Pull Request + 1 revisión antes de mergear.
-- Como cada uno posee su carpeta, los conflictos son casi nulos.
-- `.gitignore`: `data/raw/`, `data/staging/`, `.env`, `__pycache__/`.
 
 ---
 
-## 6. Cómo se conecta TODO en Airflow (sin rehacer nada)
+## Cómo ejecutar
 
-Cada loader expone funciones limpias, p. ej.:
+### 1. Levantar el entorno
 
-```python
-# src/loaders/mongo_loader.py  (lo escribe el dueño de Mongo)
-def load_businesses(records: list[dict]) -> int: ...
-def load_reviews(records: list[dict]) -> int: ...
+```bash
+bash start.sh
 ```
 
-El DAG **solo importa y llama** esas funciones:
+Levanta todos los servicios vía Docker Compose:
+- MongoDB → `localhost:27017`
+- Cassandra → `localhost:9042`
+- Neo4j → `localhost:7474` / `7687`
+- Airflow → `localhost:8080` (admin / admin)
 
-```python
-# dags/yelp_pipeline_dag.py  (lo escribe el de Airflow)
-from src.loaders import mongo_loader, cassandra_loader, neo4j_loader
+### 2. Abrir el dashboard
 
-PythonOperator(task_id="load_mongo",
-               python_callable=mongo_loader.load_reviews, ...)
+```bash
+PYTHONPATH=. .venv/bin/python3 -m streamlit run dashboard/app.py
 ```
 
-Flujo del DAG (las 6 etapas que pide el documento), programado `@daily`:
+→ [http://localhost:8501](http://localhost:8501)
+
+### 3. Demo del pipeline Airflow
+
+```bash
+# Script de demo con polling en tiempo real
+bash scripts/demo_airflow.sh
+
+# O triggear una fecha específica
+PYTHONPATH=. .venv/bin/python3 scripts/trigger_date.py 2019-01-27
+```
+
+El script triggea el DAG `yelp_pipeline` y muestra el estado de cada tarea en tiempo real. Al terminar imprime las URLs del UI de Airflow y del dashboard.
+
+### 4. Airflow UI
 
 ```
-extract → validate_clean → load_mongo → ┬→ transform_load_cassandra →┐
-                                         └→ build_load_neo4j ─────────┴→ generate_kpis
+http://localhost:8080   →   admin / admin
 ```
-
-Cada corrida procesa **el "día lógico"** `{{ ds }}` → así simulamos actualizaciones
-incrementales y cumplimos "ejecución programada".
 
 ---
 
-## 7. Dashboard y KPIs
+## KPIs implementados
 
-- **Tecnología:** Streamlit + Plotly (rápido para explorar + gráficos bonitos).
-- Lee de las **3 bases**: Mongo (detalle/documentos), Cassandra (series/KPIs por
-  fecha), Neo4j (red).
-- **5 KPIs obligatorios** (cada uno con definición, fórmula, interpretación):
+Todos calculados por fecha y persistidos en Cassandra (`kpi_results`). El dashboard los muestra con delta respecto al día anterior.
 
-| # | KPI | Fórmula | Fuente |
+| # | KPI | Descripción | Fuente |
 |---|---|---|---|
-| 1 | Reseñas procesadas por día | `COUNT(reviews where date=D)` | Cassandra |
-| 2 | Crecimiento diario de reseñas (%) | `(C_D − C_{D-1}) / C_{D-1} × 100` | Cassandra |
-| 3 | Calificación promedio por categoría | `AVG(stars) GROUP BY category` | Mongo / Cassandra |
-| 4 | Usuario más influyente (centralidad) | `max grado en grafo FRIEND` (o PageRank) | Neo4j |
-| 5 | Top negocios por reseñas de la red | negocios más reseñados por amigos | Neo4j + Mongo |
-| 6 (extra) | Índice de sentimiento promedio | `AVG(sentiment) por categoría/fecha` | enriquecimiento NLP |
+| 1 | `reviews_per_day` | Reseñas procesadas ese día | `daily_review_counts` |
+| 2 | `daily_growth_pct` | Crecimiento % vs día anterior | `daily_review_counts` |
+| 3 | `top_category_avg_stars` | Rating de la categoría mejor calificada (mín 3 reseñas) | `category_daily_stats` |
+| 4 | `active_categories` | Nº de categorías con al menos 1 reseña | `category_daily_stats` |
+| 5 | `avg_stars_of_day` | Rating promedio ponderado por volumen | `category_daily_stats` |
+| 6 | `avg_sentiment` | Sentimiento VADER promedio (–1 → +1) | `category_daily_stats` |
+| 7 | `top_category_quality_score` | Score `stars × (sentiment+1) × reviews` | `category_daily_stats` |
+| 8 | `pct_high_rated_categories` | % categorías con avg_stars ≥ 4.0 | `category_daily_stats` |
+| 9 | `pct_positive_categories` | % categorías con sentimiento VADER > 0.1 | `category_daily_stats` |
 
-Detalle completo en `05_airflow_dashboard.md`.
+Adicionalmente, el dashboard muestra **4 métricas estructurales de Neo4j** (usuario más influyente, negocio más reseñado, total FRIEND / REVIEWED) calculadas una sola vez sobre el grafo completo.
 
 ---
 
-## 8. Cronograma (faltan ~4 semanas → entrega 06/07/2026)
+## Equipo
 
-| Semana | Objetivo | Quién |
+| Integrante | Código | Rol |
 |---|---|---|
-| **1** | Repo + `docker-compose` corriendo en las 5 máquinas. Data Engineer baja datos, hace EDA y **congela el contrato** (`schema.py`). | Todos / DE lidera |
-| **2** | Cada dueño crea su esquema + loader + CRUD sobre una muestra. DE entrega `staging/` final. | DBs + DE |
-| **3** | Integración en Airflow (cablear loaders al DAG), KPIs, esqueleto del dashboard. | Airflow lidera, apoyan DBs |
-| **4** | Pulir dashboard, capturar evidencias, escribir informe PDF, grabar video (≤15 min), colchón. | Todos |
+| Quenta Solis, Jorge Eduardo | 202310623 | Data Engineer · Airflow · Dashboard |
+| Velo Poma, Juan David | 202410587 | MongoDB |
+| Cortez Rojas, Melanie Alexia | 202210100 | Cassandra |
+| Maguiña Aranda, Paola Mercedes | 202120695 | Neo4j |
+| Maquera Bobadilla, Diva Stewart | 202310599 | ETL · Limpieza |
+| Yangali Cáceres, Luciana | 202310298 | KPIs · Informe |
+
+**Docente:** Lezama Benavides, Aldo Martin
 
 ---
 
-## 9. Entregables (del documento del profe)
+## Repositorio
 
-- [ ] Informe técnico (PDF) — secciones en `docs/`
-- [ ] Código fuente completo (este repo)
-- [ ] Scripts de creación de BD (`scripts/`)
-- [ ] DAG de Airflow (`dags/`)
-- [ ] Dashboard funcional (`dashboard/`)
-- [ ] Video demostrativo ≤ 15 min
-- [ ] **Demostrar CRUD en vivo** durante la exposición (cada dueño el suyo)
+[https://github.com/jorge-qs/Proyecto-Final-Big-Data](https://github.com/jorge-qs/Proyecto-Final-Big-Data)
